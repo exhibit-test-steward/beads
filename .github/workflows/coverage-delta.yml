@@ -1,0 +1,150 @@
+name: Coverage Delta
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  coverage-delta:
+    name: Report Coverage Delta
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Install ICU4C (Linux)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libicu-dev
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "CI Bot"
+          git config --global user.email "ci@beads.test"
+
+      - name: Install gotestsum
+        run: go install gotest.tools/gotestsum@latest
+
+      - name: Run tests with coverage (HEAD)
+        run: |
+          gotestsum --format testdox -- -race -short -coverprofile=coverage-head.out ./...
+
+      - name: Generate per-package coverage report (HEAD)
+        run: |
+          go tool cover -func=coverage-head.out > coverage-head.txt
+
+      - name: Checkout base branch
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git checkout origin/${{ github.base_ref }}
+
+      - name: Run tests with coverage (BASE)
+        run: |
+          gotestsum --format testdox -- -race -short -coverprofile=coverage-base.out ./...
+
+      - name: Generate per-package coverage report (BASE)
+        run: |
+          go tool cover -func=coverage-base.out > coverage-base.txt
+
+      - name: Calculate coverage delta
+        id: delta
+        run: |
+          # Parse base coverage by package
+          awk '/^total:/ {next} {pkg=$1; gsub(/[^\/]*$/, "", pkg); cov=$3; gsub(/%/, "", cov); pkgs[pkg]+=cov; count[pkg]++} END {for(p in pkgs) if(count[p]>0) print p, pkgs[p]/count[p]}' coverage-base.txt | sort > base-packages.txt
+
+          # Parse head coverage by package
+          awk '/^total:/ {next} {pkg=$1; gsub(/[^\/]*$/, "", pkg); cov=$3; gsub(/%/, "", cov); pkgs[pkg]+=cov; count[pkg]++} END {for(p in pkgs) if(count[p]>0) print p, pkgs[p]/count[p]}' coverage-head.txt | sort > head-packages.txt
+
+          # Calculate deltas
+          {
+            echo "# Coverage Delta by Package"
+            echo ""
+            echo "| Package | Base | Head | Delta |"
+            echo "|---------|------|------|-------|"
+
+            join -a1 -a2 -e "0.0" -o auto base-packages.txt head-packages.txt | \
+            while read pkg base_cov head_cov; do
+              base_cov=${base_cov:-0.0}
+              head_cov=${head_cov:-0.0}
+              delta=$(echo "$head_cov - $base_cov" | bc -l)
+
+              # Format with sign
+              if (( $(echo "$delta > 0" | bc -l) )); then
+                delta_str="+$(printf "%.1f" $delta)%"
+                emoji="📈"
+              elif (( $(echo "$delta < 0" | bc -l) )); then
+                delta_str="$(printf "%.1f" $delta)%"
+                emoji="📉"
+              else
+                delta_str="±0.0%"
+                emoji="➡️"
+              fi
+
+              # Only show packages with changes or significant coverage
+              if (( $(echo "$delta != 0 || $head_cov > 10" | bc -l) )); then
+                printf "| %s | %.1f%% | %.1f%% | %s %s |\n" "$pkg" "$base_cov" "$head_cov" "$emoji" "$delta_str"
+              fi
+            done
+
+            echo ""
+            echo "---"
+
+            # Overall coverage
+            base_total=$(awk '/^total:/ {print $3}' coverage-base.txt | sed 's/%//')
+            head_total=$(awk '/^total:/ {print $3}' coverage-head.txt | sed 's/%//')
+            total_delta=$(echo "$head_total - $base_total" | bc -l)
+
+            echo "**Overall Coverage:** ${base_total}% → ${head_total}% ($(printf "%+.1f" $total_delta)%%)"
+
+          } > delta-comment.md
+
+          cat delta-comment.md
+
+      - name: Post PR comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const commentBody = fs.readFileSync('delta-comment.md', 'utf8');
+
+            // Find existing coverage delta comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(comment =>
+              comment.user.type === 'Bot' &&
+              comment.body.includes('# Coverage Delta by Package')
+            );
+
+            if (botComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: commentBody
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: commentBody
+              });
+            }
