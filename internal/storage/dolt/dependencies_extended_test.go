@@ -1108,4 +1108,252 @@ func TestAddDependency_ParentChild_CrossType_Allowed(t *testing.T) {
 	}
 }
 
+// =============================================================================
+// Cross-Prefix Dependency Validation Matrix Tests
+// =============================================================================
+
+// TestAddDependency_ValidationMatrix provides comprehensive coverage of cross-prefix
+// dependency validation scenarios including same-rig, cross-rig, and external references.
+// This test matrix verifies that:
+// - Same-prefix dependencies validate target existence
+// - Cross-prefix dependencies skip target existence checks
+// - External references (external:*) skip target validation
+// - Cross-type blocking validation still applies in all scenarios
+func TestAddDependency_ValidationMatrix(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	// Create test issues with various prefixes to simulate multi-rig environment
+	testIssues := []*types.Issue{
+		{ID: "test-source-task", Title: "Test Source Task", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask},
+		{ID: "test-target-task", Title: "Test Target Task", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeTask},
+		{ID: "test-source-epic", Title: "Test Source Epic", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeEpic},
+		{ID: "test-target-epic", Title: "Test Target Epic", Status: types.StatusOpen, Priority: 1, IssueType: types.TypeEpic},
+	}
+	for _, issue := range testIssues {
+		if err := store.CreateIssue(ctx, issue, "tester"); err != nil {
+			t.Fatalf("failed to create issue %s: %v", issue.ID, err)
+		}
+	}
+
+	// Define test matrix covering all validation scenarios
+	tests := []struct {
+		name           string
+		sourceID       string
+		targetID       string
+		depType        types.DependencyType
+		shouldSucceed  bool
+		errorSubstring string
+		description    string
+	}{
+		// Same-rig scenarios (same prefix = "test-")
+		{
+			name:          "same-rig: task→task (target exists)",
+			sourceID:      "test-source-task",
+			targetID:      "test-target-task",
+			depType:       types.DepBlocks,
+			shouldSucceed: true,
+			description:   "Same-prefix blocking dependency with valid target",
+		},
+		{
+			name:           "same-rig: task→nonexistent",
+			sourceID:       "test-source-task",
+			targetID:       "test-nonexistent-abc",
+			depType:        types.DepBlocks,
+			shouldSucceed:  false,
+			errorSubstring: "not found",
+			description:    "Same-prefix dependency must validate target existence",
+		},
+		{
+			name:           "same-rig: task→epic (cross-type block)",
+			sourceID:       "test-source-task",
+			targetID:       "test-target-epic",
+			depType:        types.DepBlocks,
+			shouldSucceed:  false,
+			errorSubstring: "can only block",
+			description:    "Cross-type blocking validation applies even in same-rig",
+		},
+		{
+			name:          "same-rig: epic→epic (same-type block)",
+			sourceID:      "test-source-epic",
+			targetID:      "test-target-epic",
+			depType:       types.DepBlocks,
+			shouldSucceed: true,
+			description:   "Same-type blocking is allowed",
+		},
+
+		// Cross-rig scenarios (different prefixes)
+		{
+			name:          "cross-rig: test→hq (target may not exist locally)",
+			sourceID:      "test-source-task",
+			targetID:      "hq-remote-issue",
+			depType:       types.DepBlocks,
+			shouldSucceed: true,
+			description:   "Cross-prefix dependency skips target existence check",
+		},
+		{
+			name:          "cross-rig: test→gt (different rig database)",
+			sourceID:      "test-source-task",
+			targetID:      "gt-other-rig-issue",
+			depType:       types.DepBlocks,
+			shouldSucceed: true,
+			description:   "Cross-prefix to different rig database succeeds",
+		},
+		{
+			name:          "cross-rig: test→sh (typo in prefix is allowed)",
+			sourceID:      "test-source-task",
+			targetID:      "sh-potentially-typo",
+			depType:       types.DepBlocks,
+			shouldSucceed: true,
+			description:   "Cross-prefix allows typos (no validation of target rig)",
+		},
+		{
+			name:          "cross-rig: related dependency type",
+			sourceID:      "test-source-task",
+			targetID:      "hq-remote-related",
+			depType:       types.DepRelated,
+			shouldSucceed: true,
+			description:   "Cross-prefix with non-blocking dependency type",
+		},
+
+		// External reference scenarios (external:*)
+		{
+			name:          "external: GitHub issue reference",
+			sourceID:      "test-source-task",
+			targetID:      "external:github:owner/repo#123",
+			depType:       types.DepRelated,
+			shouldSucceed: true,
+			description:   "External GitHub reference skips validation",
+		},
+		{
+			name:          "external: Jira ticket reference",
+			sourceID:      "test-source-task",
+			targetID:      "external:jira:PROJ-456",
+			depType:       types.DepBlocks,
+			shouldSucceed: true,
+			description:   "External Jira reference skips validation",
+		},
+		{
+			name:          "external: Cross-rig tracking (convoy pattern)",
+			sourceID:      "test-source-epic",
+			targetID:      "external:da:da-7eo",
+			depType:       "tracks",
+			shouldSucceed: true,
+			description:   "Convoy-style cross-rig tracking with external prefix",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dep := &types.Dependency{
+				IssueID:     tt.sourceID,
+				DependsOnID: tt.targetID,
+				Type:        tt.depType,
+			}
+
+			err := store.AddDependency(ctx, dep, "tester")
+
+			if tt.shouldSucceed {
+				if err != nil {
+					t.Errorf("expected success for %s, got error: %v\nDescription: %s",
+						tt.name, err, tt.description)
+				} else {
+					// Verify dependency was created
+					records, getErr := store.GetDependencyRecords(ctx, tt.sourceID)
+					if getErr != nil {
+						t.Errorf("failed to verify dependency creation: %v", getErr)
+					} else {
+						found := false
+						for _, r := range records {
+							if r.DependsOnID == tt.targetID && r.Type == tt.depType {
+								found = true
+								break
+							}
+						}
+						if !found {
+							t.Errorf("dependency was not stored: %s → %s", tt.sourceID, tt.targetID)
+						} else {
+							// Clean up: remove dependency for next iteration
+							_ = store.RemoveDependency(ctx, tt.sourceID, tt.targetID, "tester")
+						}
+					}
+				}
+			} else {
+				if err == nil {
+					t.Errorf("expected failure for %s, but succeeded\nDescription: %s",
+						tt.name, tt.description)
+					// Clean up unexpected success
+					_ = store.RemoveDependency(ctx, tt.sourceID, tt.targetID, "tester")
+				} else if tt.errorSubstring != "" && !strings.Contains(err.Error(), tt.errorSubstring) {
+					t.Errorf("expected error containing %q for %s, got: %v\nDescription: %s",
+						tt.errorSubstring, tt.name, err, tt.description)
+				}
+			}
+		})
+	}
+}
+
+// TestCrossPrefix_TypoInTargetRig verifies that cross-prefix dependencies
+// allow typos in target rig names because target existence is not validated.
+// This is the current behavior documented in the backlog rationale.
+func TestCrossPrefix_TypoInTargetRig(t *testing.T) {
+	store, cleanup := setupTestStore(t)
+	defer cleanup()
+
+	ctx, cancel := testContext(t)
+	defer cancel()
+
+	source := &types.Issue{
+		ID:        "test-typo-source",
+		Title:     "Source Issue",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, source, "tester"); err != nil {
+		t.Fatalf("failed to create source issue: %v", err)
+	}
+
+	// Typo in target rig name: "typo-xyz" might not be a configured rig
+	// but the dependency is allowed because cross-prefix deps skip validation
+	dep := &types.Dependency{
+		IssueID:     "test-typo-source",
+		DependsOnID: "typo-does-not-exist",
+		Type:        types.DepBlocks,
+	}
+
+	err := store.AddDependency(ctx, dep, "tester")
+	if err != nil {
+		t.Errorf("cross-prefix dependency with typo should succeed (no validation), got: %v", err)
+	}
+
+	// Verify it was stored
+	records, err := store.GetDependencyRecords(ctx, "test-typo-source")
+	if err != nil {
+		t.Fatalf("GetDependencyRecords failed: %v", err)
+	}
+	found := false
+	for _, r := range records {
+		if r.DependsOnID == "typo-does-not-exist" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("cross-prefix dependency with typo was not stored")
+	}
+}
+
+// TestCrossPrefix_ConfigParsing verifies that allowed_prefixes config
+// is parsed correctly. This is a placeholder for future allowed_prefixes
+// validation logic if it gets added to prevent typos.
+func TestCrossPrefix_ConfigParsing(t *testing.T) {
+	t.Skip("Placeholder: allowed_prefixes config validation not yet implemented")
+	// Future test: Verify comma-separated allowed_prefixes are parsed correctly
+	// and that cross-prefix deps validate against the allowlist
+}
+
 // Note: testContext is already defined in dolt_test.go for this package
