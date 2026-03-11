@@ -437,6 +437,13 @@ func runDiagnostics(path string) doctorResult {
 		result.OverallOK = false
 	}
 
+	// Check 2a.5: Dolt ignored tables existence (dolt_ignore'd tables must be recreated each session)
+	ignoredTablesCheck := convertWithCategory(doctor.CheckIgnoredTablesExist(path), doctor.CategoryCore)
+	result.Checks = append(result.Checks, ignoredTablesCheck)
+	if ignoredTablesCheck.Status == statusError {
+		result.OverallOK = false
+	}
+
 	// Check 2b: Repo fingerprint (detects wrong database or URL change)
 	fingerprintCheck := convertWithCategory(doctor.CheckRepoFingerprint(path), doctor.CategoryCore)
 	result.Checks = append(result.Checks, fingerprintCheck)
