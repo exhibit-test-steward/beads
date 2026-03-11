@@ -7,6 +7,16 @@ import (
 )
 
 // DoltDockerImage is the Docker image used for Dolt test containers.
+//
+// IMPORTANT: This version is PINNED to prevent silent test breakage from
+// Dolt SQL dialect changes or query plan regressions. Before upgrading:
+//
+// 1. Review the Dolt changelog between current and target versions
+// 2. Run the full test suite (including integration tests)
+// 3. Pay special attention to search/query tests
+// 4. Document any SQL compatibility issues in the upgrade commit
+//
+// See scripts/check-dolt-version.sh for automated upgrade validation.
 const DoltDockerImage = "dolthub/dolt-sql-server:1.83.0"
 
 // FindFreePort finds an available TCP port by binding to :0.

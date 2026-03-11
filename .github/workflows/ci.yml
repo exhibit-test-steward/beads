@@ -17,6 +17,16 @@ jobs:
       - name: Check all versions match
         run: ./scripts/check-versions.sh
 
+  # Fast check to ensure Dolt Docker image version is pinned
+  check-dolt-version:
+    name: Check Dolt version pinning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Validate Dolt version pinning
+        run: ./scripts/check-dolt-version.sh
+
   # Fast check to catch accidental .beads/issues.jsonl changes from contributors
   check-no-beads-changes:
     name: Check for .beads changes
