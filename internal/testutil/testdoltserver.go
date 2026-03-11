@@ -26,6 +26,15 @@ type doltServer struct {
 // serverStartTimeout is the max time to wait for the test Dolt server to accept connections.
 const serverStartTimeout = 60 * time.Second
 
+// containerPullTimeout is the max time for a single container pull attempt (for cold starts).
+const containerPullTimeout = 5 * time.Minute
+
+// maxContainerStartRetries is the number of times to retry container start on failure.
+const maxContainerStartRetries = 3
+
+// retryBackoffBase is the base delay for exponential backoff between retries.
+const retryBackoffBase = 2 * time.Second
+
 // Module-level singleton state.
 var (
 	doltServerOnce    sync.Once
@@ -133,35 +142,62 @@ func isDoltRepoImageCached() bool {
 	return err == nil && len(strings.TrimSpace(string(out))) > 0
 }
 
-// startDoltContainer starts the singleton Dolt container.
+// startDoltContainer starts the singleton Dolt container with retry logic for cold-start pull failures.
 func startDoltContainer() error {
-	ctx, cancel := context.WithTimeout(context.Background(), serverStartTimeout)
-	defer cancel()
+	var lastErr error
 
-	ctr, err := dolt.Run(ctx, DoltDockerImage,
-		dolt.WithDatabase("beads_test"),
-	)
-	if err != nil {
-		return fmt.Errorf("starting Dolt container: %w", err)
+	for attempt := 1; attempt <= maxContainerStartRetries; attempt++ {
+		if attempt > 1 {
+			backoff := retryBackoffBase * time.Duration(1<<uint(attempt-2))
+			fmt.Fprintf(os.Stderr, "INFO: Dolt container start attempt %d/%d (backoff: %v)\n",
+				attempt, maxContainerStartRetries, backoff)
+			time.Sleep(backoff)
+		} else {
+			fmt.Fprintf(os.Stderr, "INFO: Starting Dolt container (attempt %d/%d, timeout: %v)\n",
+				attempt, maxContainerStartRetries, containerPullTimeout)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), containerPullTimeout)
+		ctr, err := dolt.Run(ctx, DoltDockerImage,
+			dolt.WithDatabase("beads_test"),
+		)
+		cancel()
+
+		if err != nil {
+			lastErr = fmt.Errorf("starting Dolt container (attempt %d): %w", attempt, err)
+			fmt.Fprintf(os.Stderr, "WARN: %v\n", lastErr)
+			continue
+		}
+
+		// Container started successfully, get port
+		ctx2, cancel2 := context.WithTimeout(context.Background(), serverStartTimeout)
+		defer cancel2()
+
+		p, err := ctr.MappedPort(ctx2, "3306/tcp")
+		if err != nil {
+			_ = testcontainers.TerminateContainer(ctr)
+			lastErr = fmt.Errorf("getting mapped port (attempt %d): %w", attempt, err)
+			fmt.Fprintf(os.Stderr, "WARN: %v\n", lastErr)
+			continue
+		}
+
+		if _, err := strconv.Atoi(p.Port()); err != nil {
+			_ = testcontainers.TerminateContainer(ctr)
+			lastErr = fmt.Errorf("parsing port %q (attempt %d): %w", p.Port(), attempt, err)
+			fmt.Fprintf(os.Stderr, "WARN: %v\n", lastErr)
+			continue
+		}
+
+		doltTestPort = p.Port()
+		doltSingletonSrv = &doltServer{
+			container: ctr,
+		}
+
+		fmt.Fprintf(os.Stderr, "INFO: Dolt container started successfully on port %s\n", doltTestPort)
+		return nil
 	}
 
-	p, err := ctr.MappedPort(ctx, "3306/tcp")
-	if err != nil {
-		_ = testcontainers.TerminateContainer(ctr)
-		return fmt.Errorf("getting mapped port: %w", err)
-	}
-
-	if _, err := strconv.Atoi(p.Port()); err != nil {
-		_ = testcontainers.TerminateContainer(ctr)
-		return fmt.Errorf("parsing port %q: %w", p.Port(), err)
-	}
-
-	doltTestPort = p.Port()
-	doltSingletonSrv = &doltServer{
-		container: ctr,
-	}
-
-	return nil
+	return fmt.Errorf("failed to start Dolt container after %d attempts: %w", maxContainerStartRetries, lastErr)
 }
 
 // terminateSharedContainer stops and removes the shared Dolt container.
