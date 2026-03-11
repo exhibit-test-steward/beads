@@ -260,3 +260,36 @@ func TestCheckLockHealth_NonDoltBackend(t *testing.T) {
 		t.Errorf("expected OK for non-Dolt backend, got %s", check.Status)
 	}
 }
+
+func TestCheckIgnoredTablesExist_NoServer(t *testing.T) {
+	// Without a running dolt sql-server, the check should fail gracefully
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0o755); err != nil {
+		t.Fatalf("failed to create beads dir: %v", err)
+	}
+
+	// Write metadata.json marking this as dolt backend
+	configContent := []byte(`{"backend":"dolt"}`)
+	if err := os.WriteFile(filepath.Join(beadsDir, "metadata.json"), configContent, 0o644); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	// Point at a port nothing listens on to ensure connection fails
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "59997")
+
+	check := CheckIgnoredTablesExist(tmpDir)
+	if check.Name != "Dolt Ignored Tables" {
+		t.Errorf("expected check name 'Dolt Ignored Tables', got %q", check.Name)
+	}
+	if check.Status != StatusError {
+		t.Errorf("expected StatusError (no server running), got %s: %s", check.Status, check.Message)
+	}
+	if !strings.Contains(check.Message, "Failed to open database") {
+		t.Errorf("expected failure message about database, got: %s", check.Message)
+	}
+}
+
+// TestCheckIgnoredTablesExist_Integration would test with a real Dolt server,
+// but that requires integration test infrastructure. The check is simple enough
+// that unit tests of the helper function and end-to-end manual testing suffice.

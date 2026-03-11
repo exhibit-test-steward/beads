@@ -631,6 +631,83 @@ func checkPhantomDatabases(conn *doltConn) DoctorCheck {
 	}
 }
 
+// CheckIgnoredTablesExist verifies that all dolt_ignore'd tables exist in the
+// working set. These tables (wisps, wisp_*) are excluded from Dolt version
+// tracking and must be recreated on every server session. This check is
+// proactive — it runs even when the tables exist, providing clear guidance
+// for users who hit "table not found" errors with no diagnostic path.
+// (GH#2288)
+func CheckIgnoredTablesExist(path string) DoctorCheck {
+	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+
+	if !IsDoltBackend(beadsDir) {
+		return DoctorCheck{
+			Name:     "Dolt Ignored Tables",
+			Status:   StatusOK,
+			Message:  "N/A (not using Dolt backend)",
+			Category: CategoryCore,
+		}
+	}
+
+	conn, err := openDoltConn(beadsDir)
+	if err != nil {
+		return DoctorCheck{
+			Name:     "Dolt Ignored Tables",
+			Status:   StatusError,
+			Message:  "Failed to open database",
+			Detail:   err.Error(),
+			Category: CategoryCore,
+		}
+	}
+	defer conn.Close()
+
+	return checkIgnoredTablesWithDB(conn)
+}
+
+// checkIgnoredTablesWithDB verifies all dolt_ignore'd tables exist.
+func checkIgnoredTablesWithDB(conn *doltConn) DoctorCheck {
+	ctx := context.Background()
+
+	// All dolt_ignore'd tables that must exist in the working set.
+	// These are defined in migrations/004_wisps_table.go and
+	// migrations/005_wisp_auxiliary_tables.go.
+	requiredIgnoredTables := []string{
+		"wisps",
+		"wisp_labels",
+		"wisp_dependencies",
+		"wisp_events",
+		"wisp_comments",
+	}
+
+	var missingTables []string
+	for _, table := range requiredIgnoredTables {
+		var count int
+		err := conn.db.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s LIMIT 1", table)).Scan(&count)
+		if err != nil {
+			missingTables = append(missingTables, table)
+		}
+	}
+
+	if len(missingTables) > 0 {
+		return DoctorCheck{
+			Name:     "Dolt Ignored Tables",
+			Status:   StatusError,
+			Message:  fmt.Sprintf("Missing %d dolt_ignore'd table(s): %v", len(missingTables), missingTables),
+			Detail:   "These tables are excluded from Dolt version control and must be recreated each server session",
+			Fix:      "Run any bd command (e.g., 'bd list') to trigger automatic table recreation, or restart the Dolt server",
+			Category: CategoryCore,
+		}
+	}
+
+	return DoctorCheck{
+		Name:     "Dolt Ignored Tables",
+		Status:   StatusOK,
+		Message:  "All dolt_ignore'd tables present",
+		Detail:   fmt.Sprintf("Verified %d tables: %s", len(requiredIgnoredTables), strings.Join(requiredIgnoredTables, ", ")),
+		Category: CategoryCore,
+	}
+}
+
 // probeForCorrectDatabase checks if another database on the same server has the
 // expected beads tables. Returns the database name if found, empty string otherwise.
 // Used by checkSchemaWithDB to detect pre-#2142 migrations where dolt_database
