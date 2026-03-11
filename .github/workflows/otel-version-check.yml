@@ -1,0 +1,49 @@
+name: OpenTelemetry Version Lockstep Check
+
+on:
+  pull_request:
+    paths:
+      - 'go.mod'
+      - 'go.sum'
+  push:
+    branches:
+      - main
+
+jobs:
+  check-otel-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check OpenTelemetry package versions are in lockstep
+        run: |
+          echo "Checking OpenTelemetry package versions in go.mod..."
+
+          # Extract all go.opentelemetry.io/otel* package versions from go.mod
+          OTEL_VERSIONS=$(grep -E '^\s+go\.opentelemetry\.io/otel' go.mod | awk '{print $2}' | sort -u)
+
+          # Count unique versions
+          VERSION_COUNT=$(echo "$OTEL_VERSIONS" | wc -l)
+
+          echo "Found OpenTelemetry packages with versions:"
+          grep -E '^\s+go\.opentelemetry\.io/otel' go.mod
+
+          echo ""
+          echo "Unique versions detected: $VERSION_COUNT"
+          echo "$OTEL_VERSIONS"
+
+          # Fail if more than one unique version exists
+          if [ "$VERSION_COUNT" -gt 1 ]; then
+            echo ""
+            echo "❌ ERROR: OpenTelemetry packages have version skew!"
+            echo "All go.opentelemetry.io/otel* packages must use the same version."
+            echo "Mixed versions cause runtime panics from incompatible internal interfaces."
+            echo ""
+            echo "Found versions:"
+            echo "$OTEL_VERSIONS"
+            exit 1
+          fi
+
+          echo ""
+          echo "✅ All OpenTelemetry packages are at the same version: $(echo "$OTEL_VERSIONS" | head -n1)"
