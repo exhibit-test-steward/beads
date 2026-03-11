@@ -50,7 +50,10 @@ func TestMain(m *testing.M) {
 func testMainInner(m *testing.M) int {
 	os.Setenv("BEADS_TEST_MODE", "1")
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
+		// Silent skip for explicit BEADS_TEST_SKIP=dolt (see docs/TESTING.md)
+		if !strings.Contains(err.Error(), "BEADS_TEST_SKIP") {
+			fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
+		}
 	} else {
 		defer testutil.TerminateDoltContainer()
 		testDoltPort = testutil.DoltContainerPortInt()

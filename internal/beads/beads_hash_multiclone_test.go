@@ -26,7 +26,10 @@ func TestMain(m *testing.M) {
 
 	// Start an isolated Dolt server so integration tests don't hit production.
 	if err := testutil.EnsureDoltContainerForTestMain(); err != nil {
-		fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
+		// Silent skip for explicit BEADS_TEST_SKIP=dolt (see docs/TESTING.md)
+		if !strings.Contains(err.Error(), "BEADS_TEST_SKIP") {
+			fmt.Fprintf(os.Stderr, "WARN: %v, skipping Dolt tests\n", err)
+		}
 	} else {
 		defer testutil.TerminateDoltContainer()
 		testDoltPort = testutil.DoltContainerPortInt()
