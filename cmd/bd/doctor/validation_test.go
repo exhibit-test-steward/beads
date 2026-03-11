@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -616,5 +617,105 @@ func TestCheckGitConflicts_DoltBackend_Clean(t *testing.T) {
 
 	if hasConflicts {
 		t.Fatal("Expected no conflicts in clean database")
+	}
+}
+
+// TestCheckOrphanedWispDependencies_NoOrphans verifies the check reports OK
+// when all wisp_dependencies reference valid wisps or issues.
+func TestCheckOrphanedWispDependencies_NoOrphans(t *testing.T) {
+	store := newTestDoltStore(t, "test")
+	db := store.DB()
+
+	// Ensure wisp tables exist (using package-level function)
+	if err := dolt.CreateIgnoredTables(db); err != nil {
+		t.Fatalf("Failed to create wisp tables: %v", err)
+	}
+
+	// Create a wisp
+	wispID := "wisp-test"
+	_, err := db.Exec(`INSERT INTO wisps (id, title, status, priority, issue_type, created_at, updated_at)
+		VALUES (?, 'Test wisp', 'open', 1, 'task', NOW(), NOW())`, wispID)
+	if err != nil {
+		t.Fatalf("Failed to create wisp: %v", err)
+	}
+
+	// Create a wisp dependency pointing to the valid wisp
+	_, err = db.Exec(`INSERT INTO wisp_dependencies (issue_id, depends_on_id, type)
+		VALUES ('wisp-child', ?, 'blocks')`, wispID)
+	if err != nil {
+		t.Fatalf("Failed to create wisp dependency: %v", err)
+	}
+
+	check := checkOrphanedWispDependenciesDB(db)
+
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q", check.Status, StatusOK)
+		t.Logf("Message: %s", check.Message)
+	}
+}
+
+// TestCheckOrphanedWispDependencies_DetectsOrphans verifies the check detects
+// wisp_dependencies rows pointing to non-existent wisps.
+func TestCheckOrphanedWispDependencies_DetectsOrphans(t *testing.T) {
+	store := newTestDoltStore(t, "test")
+	db := store.DB()
+
+	// Ensure wisp tables exist (using package-level function)
+	if err := dolt.CreateIgnoredTables(db); err != nil {
+		t.Fatalf("Failed to create wisp tables: %v", err)
+	}
+
+	// Create orphaned wisp dependency (depends_on_id references non-existent wisp)
+	_, err := db.Exec(`INSERT INTO wisp_dependencies (issue_id, depends_on_id, type)
+		VALUES ('wisp-child', 'wisp-deleted', 'blocks')`)
+	if err != nil {
+		t.Fatalf("Failed to create orphaned wisp dependency: %v", err)
+	}
+
+	check := checkOrphanedWispDependenciesDB(db)
+
+	if check.Status != StatusWarning {
+		t.Errorf("Status = %q, want %q", check.Status, StatusWarning)
+	}
+	if check.Message != "1 orphaned wisp dependency reference(s)" {
+		t.Errorf("Message = %q, want '1 orphaned wisp dependency reference(s)'", check.Message)
+	}
+}
+
+// TestCheckOrphanedWispDependencies_WispToIssueValid verifies the check allows
+// wisp_dependencies pointing to regular issues (mixed dependency graphs).
+func TestCheckOrphanedWispDependencies_WispToIssueValid(t *testing.T) {
+	store := newTestDoltStore(t, "test")
+	ctx := context.Background()
+	db := store.DB()
+
+	// Ensure wisp tables exist (using package-level function)
+	if err := dolt.CreateIgnoredTables(db); err != nil {
+		t.Fatalf("Failed to create wisp tables: %v", err)
+	}
+
+	// Create a regular issue
+	issue := &types.Issue{
+		Title:     "Regular issue",
+		Status:    types.StatusOpen,
+		Priority:  1,
+		IssueType: types.TypeTask,
+	}
+	if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+		t.Fatalf("Failed to create issue: %v", err)
+	}
+
+	// Create wisp dependency pointing to the regular issue
+	_, err := db.Exec(`INSERT INTO wisp_dependencies (issue_id, depends_on_id, type)
+		VALUES ('wisp-child', ?, 'blocks')`, issue.ID)
+	if err != nil {
+		t.Fatalf("Failed to create wisp dependency: %v", err)
+	}
+
+	check := checkOrphanedWispDependenciesDB(db)
+
+	if check.Status != StatusOK {
+		t.Errorf("Status = %q, want %q (wisp→issue dependency should be valid)", check.Status, StatusOK)
+		t.Logf("Message: %s", check.Message)
 	}
 }

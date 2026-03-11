@@ -571,3 +571,92 @@ func checkChildParentDependenciesDB(db *sql.DB) DoctorCheck {
 		Category: CategoryMetadata,
 	}
 }
+
+// CheckOrphanedWispDependencies detects wisp_dependencies rows pointing to non-existent wisps.
+// Wisp GC deletes parent wisps but can leave wisp_dependency rows pointing at nonexistent IDs,
+// causing query errors. This check detects orphaned references in the ephemeral wisp_dependencies table.
+func CheckOrphanedWispDependencies(path string) DoctorCheck {
+	// Follow redirect to resolve actual beads directory
+	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+
+	db, store, err := openStoreDB(beadsDir)
+	if err != nil {
+		return DoctorCheck{
+			Name:    "Orphaned Wisp Dependencies",
+			Status:  "ok",
+			Message: "N/A (no database)",
+		}
+	}
+	defer func() { _ = store.Close() }()
+
+	return checkOrphanedWispDependenciesDB(db)
+}
+
+// checkOrphanedWispDependenciesDB is the core logic for CheckOrphanedWispDependencies.
+func checkOrphanedWispDependenciesDB(db *sql.DB) DoctorCheck {
+	// Query for orphaned wisp_dependencies where depends_on_id references a deleted wisp.
+	// wisp_dependencies can reference either wisps OR issues (for mixed dependency graphs).
+	// Check both: missing from wisps AND missing from issues means true orphan.
+	query := `
+		SELECT wd.issue_id, wd.depends_on_id, wd.type
+		FROM wisp_dependencies wd
+		LEFT JOIN wisps w ON wd.depends_on_id = w.id
+		LEFT JOIN issues i ON wd.depends_on_id = i.id
+		WHERE w.id IS NULL AND i.id IS NULL
+	`
+	rows, err := db.Query(query)
+	if err != nil {
+		// wisp_dependencies table may not exist or may be ignored (not created yet)
+		if strings.Contains(err.Error(), "no such table") || strings.Contains(err.Error(), "doesn't exist") {
+			return DoctorCheck{
+				Name:    "Orphaned Wisp Dependencies",
+				Status:  "ok",
+				Message: "N/A (wisp_dependencies table not found)",
+			}
+		}
+		return DoctorCheck{
+			Name:    "Orphaned Wisp Dependencies",
+			Status:  StatusWarning,
+			Message: "N/A (query failed)",
+			Detail:  err.Error(),
+		}
+	}
+	defer rows.Close()
+
+	var orphans []string
+	for rows.Next() {
+		var issueID, dependsOnID, depType string
+		if err := rows.Scan(&issueID, &dependsOnID, &depType); err == nil {
+			orphans = append(orphans, fmt.Sprintf("%s→%s", issueID, dependsOnID))
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return DoctorCheck{
+			Name:    "Orphaned Wisp Dependencies",
+			Status:  StatusWarning,
+			Message: "Row iteration error",
+			Detail:  err.Error(),
+		}
+	}
+
+	if len(orphans) == 0 {
+		return DoctorCheck{
+			Name:    "Orphaned Wisp Dependencies",
+			Status:  "ok",
+			Message: "No orphaned wisp dependencies",
+		}
+	}
+
+	detail := strings.Join(orphans, ", ")
+	if len(detail) > 200 {
+		detail = detail[:200] + "..."
+	}
+
+	return DoctorCheck{
+		Name:    "Orphaned Wisp Dependencies",
+		Status:  "warning",
+		Message: fmt.Sprintf("%d orphaned wisp dependency reference(s)", len(orphans)),
+		Detail:  detail,
+		Fix:     "Run 'bd doctor --fix' to remove orphaned wisp dependencies",
+	}
+}

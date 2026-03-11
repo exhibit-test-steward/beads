@@ -675,6 +675,11 @@ func runDiagnostics(path string) doctorResult {
 	result.Checks = append(result.Checks, childParentDepsCheck)
 	// Don't fail overall check for child→parent deps, just warn
 
+	// Check 22b: Orphaned wisp dependencies (wisp GC consistency)
+	orphanedWispDepsCheck := convertDoctorCheck(doctor.CheckOrphanedWispDependencies(path))
+	result.Checks = append(result.Checks, orphanedWispDepsCheck)
+	// Don't fail overall check for orphaned wisp deps, just warn
+
 	// Check 23: Duplicate issues (from bd validate)
 	duplicatesCheck := convertDoctorCheck(doctor.CheckDuplicateIssues(path, doctorGastown, gastownDuplicatesThreshold))
 	result.Checks = append(result.Checks, duplicatesCheck)
