@@ -43,6 +43,45 @@ jobs:
           fi
           echo "No .beads/issues.jsonl changes detected"
 
+  # Fast check to ensure go.sum integrity and prevent transitive dependency drift
+  check-go-sum-integrity:
+    name: Verify go.sum integrity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: 'go.mod'
+
+      - name: Verify go.sum checksums
+        run: |
+          echo "Verifying all module checksums match go.sum..."
+          go mod verify
+
+      - name: Check for missing or extra go.sum entries
+        run: |
+          echo "Checking if go.sum is synchronized with go.mod..."
+          go mod tidy
+          if ! git diff --exit-code go.sum; then
+            echo ""
+            echo "ERROR: go.sum is out of sync with go.mod"
+            echo ""
+            echo "This indicates missing or extra entries in go.sum, which can happen when:"
+            echo "  - Manual go.sum edits were made"
+            echo "  - Merge conflicts were resolved incorrectly"
+            echo "  - Dependencies were added/removed without running 'go mod tidy'"
+            echo ""
+            echo "To fix, run:"
+            echo "  go mod tidy"
+            echo "  git add go.sum"
+            echo "  git commit --amend"
+            echo ""
+            exit 1
+          fi
+          echo "go.sum is properly synchronized"
+
   # Cross-platform test matrix (Linux/macOS only - Windows uses smoke tests)
   test:
     name: Test (${{ matrix.os }})
