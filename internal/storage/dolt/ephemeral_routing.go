@@ -72,11 +72,15 @@ func (s *DoltStore) isActiveWisp(ctx context.Context, id string) bool {
 
 // wispExists checks if an ID exists in the wisps table using a lightweight query.
 // Used as a fallback for ephemeral beads with explicit (non-wisp) IDs (GH#2053).
+// Returns false if wisps table doesn't exist (pre-migration databases, GH#2271).
 func (s *DoltStore) wispExists(ctx context.Context, id string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var exists int
 	err := s.db.QueryRowContext(ctx, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1", id).Scan(&exists)
+	if isTableNotExistError(err) {
+		return false // wisps table doesn't exist on pre-migration databases
+	}
 	return err == nil
 }
 
@@ -154,6 +158,7 @@ func (s *DoltStore) partitionByWispStatus(ctx context.Context, ids []string) (wi
 
 // batchWispExists returns the set of IDs that exist in the wisps table.
 // Used by partitionByWispStatus to detect explicit-ID ephemerals in a single query.
+// Returns nil if wisps table doesn't exist (pre-migration databases, GH#2271).
 func (s *DoltStore) batchWispExists(ctx context.Context, ids []string) map[string]bool {
 	if len(ids) == 0 {
 		return nil
@@ -174,7 +179,10 @@ func (s *DoltStore) batchWispExists(ctx context.Context, ids []string) map[strin
 		fmt.Sprintf("SELECT id FROM wisps WHERE id IN (%s)", strings.Join(placeholders, ",")),
 		args...)
 	if err != nil {
-		return nil // On error, assume no wisps (safe fallback)
+		if isTableNotExistError(err) {
+			return nil // wisps table doesn't exist on pre-migration databases
+		}
+		return nil // On other errors, assume no wisps (safe fallback)
 	}
 	defer rows.Close()
 
@@ -272,6 +280,7 @@ func (s *DoltStore) PromoteFromEphemeral(ctx context.Context, id string, actor s
 
 // getAllWispDependencyRecords returns all wisp dependency records, keyed by issue_id.
 // Used by DetectCycles to include wisp dependencies in cross-table cycle detection. (bd-xe27)
+// Returns empty map if wisp_dependencies table doesn't exist (pre-migration databases, GH#2271).
 func (s *DoltStore) getAllWispDependencyRecords(ctx context.Context) (map[string][]*types.Dependency, error) {
 	rows, err := s.queryContext(ctx, `
 		SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
@@ -279,6 +288,9 @@ func (s *DoltStore) getAllWispDependencyRecords(ctx context.Context) (map[string
 		ORDER BY issue_id
 	`)
 	if err != nil {
+		if isTableNotExistError(err) {
+			return make(map[string][]*types.Dependency), nil // Table doesn't exist; return empty map
+		}
 		return nil, fmt.Errorf("failed to get all wisp dependency records: %w", err)
 	}
 	defer rows.Close()
@@ -295,6 +307,7 @@ func (s *DoltStore) getAllWispDependencyRecords(ctx context.Context) (map[string
 }
 
 // getWispDependencyRecords returns raw dependency records for a wisp from wisp_dependencies.
+// Returns empty slice if wisp_dependencies table doesn't exist (pre-migration databases, GH#2271).
 func (s *DoltStore) getWispDependencyRecords(ctx context.Context, issueID string) ([]*types.Dependency, error) {
 	rows, err := s.queryContext(ctx, `
 		SELECT issue_id, depends_on_id, type, created_at, created_by, metadata, thread_id
@@ -302,6 +315,9 @@ func (s *DoltStore) getWispDependencyRecords(ctx context.Context, issueID string
 		WHERE issue_id = ?
 	`, issueID)
 	if err != nil {
+		if isTableNotExistError(err) {
+			return []*types.Dependency{}, nil // Table doesn't exist; return empty slice
+		}
 		return nil, fmt.Errorf("failed to get wisp dependency records: %w", err)
 	}
 	defer rows.Close()

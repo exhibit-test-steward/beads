@@ -22,9 +22,13 @@ type doltTransaction struct {
 // isActiveWisp checks if an ID exists in the wisps table within the transaction.
 // Unlike the store-level isActiveWisp, this queries within the transaction so it
 // sees uncommitted wisps. Handles both -wisp- pattern and explicit-ID ephemerals (GH#2053).
+// Returns false if wisps table doesn't exist (pre-migration databases, GH#2271).
 func (t *doltTransaction) isActiveWisp(ctx context.Context, id string) bool {
 	var exists int
 	err := t.tx.QueryRowContext(ctx, "SELECT 1 FROM wisps WHERE id = ? LIMIT 1", id).Scan(&exists)
+	if isTableNotExistError(err) {
+		return false // wisps table doesn't exist on pre-migration databases
+	}
 	return err == nil
 }
 
