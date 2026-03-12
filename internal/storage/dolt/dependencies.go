@@ -93,7 +93,7 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 	// (e.g., permanent A -> wisp B -> permanent A). (bd-xe27)
 	if dep.Type == types.DepBlocks {
 		var reachable int
-		if err := tx.QueryRowContext(ctx, `
+		cycleCheckErr := tx.QueryRowContext(ctx, `
 			WITH RECURSIVE reachable AS (
 				SELECT ? AS node, 0 AS depth
 				UNION ALL
@@ -107,9 +107,28 @@ func (s *DoltStore) AddDependency(ctx context.Context, dep *types.Dependency, ac
 				WHERE r.depth < 100
 			)
 			SELECT COUNT(*) FROM reachable WHERE node = ?
-		`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
-			return fmt.Errorf("failed to check for dependency cycle: %w", err)
+		`, dep.DependsOnID, dep.IssueID).Scan(&reachable)
+
+		// If wisp_dependencies table doesn't exist (pre-migration databases),
+		// fall back to checking only the dependencies table (GH#2271).
+		if cycleCheckErr != nil && isTableNotExistError(cycleCheckErr) {
+			if err := tx.QueryRowContext(ctx, `
+				WITH RECURSIVE reachable AS (
+					SELECT ? AS node, 0 AS depth
+					UNION ALL
+					SELECT d.depends_on_id, r.depth + 1
+					FROM reachable r
+					JOIN dependencies d ON d.issue_id = r.node
+					WHERE d.type = 'blocks' AND r.depth < 100
+				)
+				SELECT COUNT(*) FROM reachable WHERE node = ?
+			`, dep.DependsOnID, dep.IssueID).Scan(&reachable); err != nil {
+				return fmt.Errorf("failed to check for dependency cycle: %w", err)
+			}
+		} else if cycleCheckErr != nil {
+			return fmt.Errorf("failed to check for dependency cycle: %w", cycleCheckErr)
 		}
+
 		if reachable > 0 {
 			return fmt.Errorf("adding dependency would create a cycle")
 		}
@@ -789,11 +808,12 @@ func (s *DoltStore) DetectCycles(ctx context.Context) ([][]*types.Issue, error) 
 		return nil, err
 	}
 
-	// Get all wisp dependencies
+	// Get all wisp dependencies (gracefully handle missing table on pre-migration databases)
 	wispDeps, err := s.getAllWispDependencyRecords(ctx)
-	if err != nil {
+	if err != nil && !isTableNotExistError(err) {
 		return nil, err
 	}
+	// If wisp_dependencies table doesn't exist, continue with empty wisp deps (GH#2271)
 
 	// Build adjacency list from both tables
 	graph := make(map[string][]string)
