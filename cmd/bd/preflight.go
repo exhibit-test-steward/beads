@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -9,6 +10,10 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/telemetry"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 )
 
 // CheckResult represents the result of a single preflight check.
@@ -66,6 +71,19 @@ func runPreflight(cmd *cobra.Command, args []string) {
 	jsonOutput, _ := cmd.Flags().GetBool("json")
 	skipLint, _ := cmd.Flags().GetBool("skip-lint")
 
+	ctx := getRootContext()
+
+	// Instrument preflight command invocation
+	tracer := telemetry.Tracer("github.com/steveyegge/beads/preflight")
+	ctx, span := tracer.Start(ctx, "bd.preflight")
+	span.SetAttributes(
+		attribute.Bool("bd.preflight.check", check),
+		attribute.Bool("bd.preflight.fix", fix),
+		attribute.Bool("bd.preflight.json", jsonOutput),
+		attribute.Bool("bd.preflight.skip_lint", skipLint),
+	)
+	defer span.End()
+
 	if fix {
 		fmt.Println("Note: --fix is not yet implemented.")
 		fmt.Println("See bd-lfak.3 through bd-lfak.5 for implementation roadmap.")
@@ -73,11 +91,12 @@ func runPreflight(cmd *cobra.Command, args []string) {
 	}
 
 	if check {
-		runChecks(jsonOutput, skipLint)
+		runChecks(ctx, jsonOutput, skipLint)
 		return
 	}
 
 	// Static checklist mode
+	span.SetAttributes(attribute.String("bd.preflight.mode", "checklist"))
 	fmt.Println("PR Readiness Checklist:")
 	fmt.Println()
 	fmt.Println("[ ] Tests pass: go test -short ./...")
@@ -91,38 +110,61 @@ func runPreflight(cmd *cobra.Command, args []string) {
 }
 
 // runChecks executes all preflight checks and reports results.
-func runChecks(jsonOutput, skipLint bool) {
+func runChecks(ctx context.Context, jsonOutput, skipLint bool) {
+	tracer := telemetry.Tracer("github.com/steveyegge/beads/preflight")
+	meter := telemetry.Meter("github.com/steveyegge/beads/preflight")
+
+	ctx, span := tracer.Start(ctx, "bd.preflight.run_checks")
+	defer span.End()
+
+	// Initialize metrics
+	checkCounter, _ := meter.Int64Counter(
+		"bd.preflight.check.count",
+		metric.WithDescription("Number of preflight checks executed"),
+	)
+	checkResultCounter, _ := meter.Int64Counter(
+		"bd.preflight.check.result",
+		metric.WithDescription("Preflight check results by outcome"),
+	)
+
 	var results []CheckResult
 
 	// Run test check
 	testResult := runTestCheck()
 	results = append(results, testResult)
+	recordCheckResult(ctx, checkCounter, checkResultCounter, "test", testResult)
 
 	// Run lint check
 	lintResult := runLintCheck(skipLint)
 	results = append(results, lintResult)
+	recordCheckResult(ctx, checkCounter, checkResultCounter, "lint", lintResult)
 
 	// Run formatting check
 	fmtResult := runFmtCheck()
 	results = append(results, fmtResult)
+	recordCheckResult(ctx, checkCounter, checkResultCounter, "format", fmtResult)
 
 	// Run beads pollution check
 	beadsResult := runBeadsPollutionCheck()
 	results = append(results, beadsResult)
+	recordCheckResult(ctx, checkCounter, checkResultCounter, "beads_pollution", beadsResult)
 
 	// Run nix hash check
 	nixResult := runNixHashCheck()
 	results = append(results, nixResult)
+	recordCheckResult(ctx, checkCounter, checkResultCounter, "nix_hash", nixResult)
 
 	// Run version sync check
 	versionResult := runVersionSyncCheck()
 	results = append(results, versionResult)
+	recordCheckResult(ctx, checkCounter, checkResultCounter, "version_sync", versionResult)
 
 	// Calculate overall result
 	allPassed := true
 	passCount := 0
 	skipCount := 0
 	warnCount := 0
+	failCount := 0
 	for _, r := range results {
 		if r.Skipped {
 			skipCount++
@@ -133,6 +175,7 @@ func runChecks(jsonOutput, skipLint bool) {
 			passCount++
 		} else {
 			allPassed = false
+			failCount++
 		}
 	}
 
@@ -143,6 +186,19 @@ func runChecks(jsonOutput, skipLint bool) {
 	}
 	if skipCount > 0 {
 		summary += fmt.Sprintf(" (%d skipped)", skipCount)
+	}
+
+	// Record overall preflight result in span
+	span.SetAttributes(
+		attribute.Bool("bd.preflight.passed", allPassed),
+		attribute.Int("bd.preflight.total_checks", len(results)),
+		attribute.Int("bd.preflight.passed_count", passCount),
+		attribute.Int("bd.preflight.failed_count", failCount),
+		attribute.Int("bd.preflight.warned_count", warnCount),
+		attribute.Int("bd.preflight.skipped_count", skipCount),
+	)
+	if !allPassed {
+		span.SetStatus(codes.Error, "preflight checks failed")
 	}
 
 	if jsonOutput {
@@ -468,4 +524,28 @@ func truncateOutput(s string, maxLen int) string {
 		return strings.TrimSpace(s)
 	}
 	return strings.TrimSpace(s[:maxLen]) + "\n... (truncated)"
+}
+
+// recordCheckResult records telemetry for a single preflight check result.
+func recordCheckResult(ctx context.Context, checkCounter, resultCounter metric.Int64Counter, checkName string, result CheckResult) {
+	// Record check execution
+	checkCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("bd.preflight.check_name", checkName),
+	))
+
+	// Determine outcome
+	outcome := "fail"
+	if result.Skipped {
+		outcome = "skipped"
+	} else if result.Warning {
+		outcome = "warning"
+	} else if result.Passed {
+		outcome = "pass"
+	}
+
+	// Record result
+	resultCounter.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("bd.preflight.check_name", checkName),
+		attribute.String("bd.preflight.outcome", outcome),
+	))
 }
