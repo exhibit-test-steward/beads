@@ -4,11 +4,42 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"time"
+
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/debug"
+	"github.com/steveyegge/beads/internal/telemetry"
 )
+
+var (
+	backupMetrics     *backupInstrumentation
+	backupMetricsOnce sync.Once
+)
+
+type backupInstrumentation struct {
+	gitPushSuppressed metric.Int64Counter
+}
+
+func getBackupMetrics() *backupInstrumentation {
+	backupMetricsOnce.Do(func() {
+		if !telemetry.Enabled() {
+			backupMetrics = &backupInstrumentation{}
+			return
+		}
+		m := telemetry.Meter("github.com/steveyegge/beads/backup")
+		gitPushSuppressed, _ := m.Int64Counter("bd.backup.git_push_suppressed",
+			metric.WithDescription("Count of backup git push operations suppressed by stealth mode (no-git-ops)"),
+		)
+		backupMetrics = &backupInstrumentation{
+			gitPushSuppressed: gitPushSuppressed,
+		}
+	})
+	return backupMetrics
+}
 
 // isBackupAutoEnabled returns whether backup should run.
 // If user explicitly configured backup.enabled, use that.
@@ -93,5 +124,16 @@ func maybeAutoBackup(ctx context.Context) {
 		if err := gitBackup(ctx); err != nil {
 			fmt.Fprintf(os.Stderr, "Warning: backup git push failed: %v\n", err)
 		}
+	} else if config.GetBool("no-git-ops") {
+		// Emit telemetry when git push is suppressed due to stealth mode.
+		// This distinguishes intentional stealth-mode suppression from other reasons
+		// git push might be disabled (e.g., explicit backup.git-push=false).
+		metrics := getBackupMetrics()
+		if metrics.gitPushSuppressed != nil {
+			metrics.gitPushSuppressed.Add(ctx, 1, metric.WithAttributes(
+				attribute.String("reason", "stealth_mode"),
+			))
+		}
+		debug.Logf("backup: git push suppressed (stealth mode active)\n")
 	}
 }
