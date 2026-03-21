@@ -115,6 +115,18 @@ sql_escape() {
     sed -e "s/\\\\/\\\\\\\\/g" -e "s/'/\\\\'/g"
 }
 
+# Validate hash-based ID format: prefix-[hash] where hash is lowercase alphanumeric
+validate_issue_id() {
+    local id="$1"
+    # Pattern: <prefix>-<hash> where hash is lowercase alphanumeric (hash-based IDs)
+    # Allow common prefixes like bd-, issue-, task-, etc.
+    if [[ "$id" =~ ^[a-z][a-z0-9]*-[a-z0-9]+$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
 # Counters
 issues_count=0
 labels_count=0
@@ -123,6 +135,12 @@ deps_orphan=0
 events_count=0
 comments_count=0
 config_count=0
+
+# Validation counters
+validation_errors=0
+labels_orphan=0
+comments_orphan=0
+issues_invalid_id=0
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║          JSONL → Dolt Migration                            ║"
@@ -149,6 +167,16 @@ import_issues() {
 
     local sql="START TRANSACTION;\n"
     while IFS= read -r line; do
+        # Validate issue ID format before processing
+        local issue_id
+        issue_id=$(echo "$line" | jq -r '.id')
+        if ! validate_issue_id "$issue_id"; then
+            echo -e "\n  ${RED}✗${NC}  Invalid issue ID format: $issue_id (expected: prefix-hash)" >&2
+            issues_invalid_id=$((issues_invalid_id + 1))
+            validation_errors=$((validation_errors + 1))
+            continue
+        fi
+
         # Extract columns and values from JSON
         local cols vals
         cols=$(echo "$line" | jq -r 'keys_unsorted | map(if . == "key" then "`key`" else . end) | join(", ")')
@@ -206,12 +234,29 @@ import_labels() {
 
     echo -ne "${BLUE}→${NC}  Importing labels..."
 
+    # Collect known issue IDs for referential integrity checking
+    local known_ids=""
+    if [[ -f "$BACKUP_DIR/issues.jsonl" ]]; then
+        known_ids=$(jq -r '.id' "$BACKUP_DIR/issues.jsonl")
+    fi
+
     local sql="START TRANSACTION;\n"
     while IFS= read -r line; do
         local issue_id label
-        issue_id=$(echo "$line" | jq -r '.issue_id' | sql_escape)
+        issue_id=$(echo "$line" | jq -r '.issue_id')
         label=$(echo "$line" | jq -r '.label' | sql_escape)
-        sql+="REPLACE INTO labels (issue_id, label) VALUES ('${issue_id}', '${label}');\n"
+
+        # Skip orphan labels (issue_id must exist in issues table)
+        if [[ -n "$known_ids" ]] && ! echo "$known_ids" | grep -qxF "$issue_id"; then
+            echo -e "\n  ${YELLOW}⚠${NC}  skipping orphan label: issue_id=$issue_id not in issues" >&2
+            labels_orphan=$((labels_orphan + 1))
+            validation_errors=$((validation_errors + 1))
+            continue
+        fi
+
+        local esc_iid
+        esc_iid=$(echo "$issue_id" | sql_escape)
+        sql+="REPLACE INTO labels (issue_id, label) VALUES ('${esc_iid}', '${label}');\n"
         labels_count=$((labels_count + 1))
     done < "$file"
     sql+="COMMIT;\n"
@@ -221,7 +266,11 @@ import_labels() {
         echo -e "$sql"
     else
         echo -e "$sql" | pipe_sql
-        echo -e " ${GREEN}✓${NC} $labels_count rows"
+        if [[ $labels_orphan -gt 0 ]]; then
+            echo -e " ${GREEN}✓${NC} $labels_count rows ($labels_orphan orphans skipped)"
+        else
+            echo -e " ${GREEN}✓${NC} $labels_count rows"
+        fi
     fi
 }
 
@@ -328,16 +377,32 @@ import_comments() {
 
     echo -ne "${BLUE}→${NC}  Importing comments..."
 
+    # Collect known issue IDs for referential integrity checking
+    local known_ids=""
+    if [[ -f "$BACKUP_DIR/issues.jsonl" ]]; then
+        known_ids=$(jq -r '.id' "$BACKUP_DIR/issues.jsonl")
+    fi
+
     local sql="START TRANSACTION;\n"
     while IFS= read -r line; do
         local id issue_id author text created_at
         id=$(echo "$line" | jq -r '.id')
-        issue_id=$(echo "$line" | jq -r '.issue_id' | sql_escape)
+        issue_id=$(echo "$line" | jq -r '.issue_id')
         author=$(echo "$line" | jq -r '.author' | sql_escape)
         text=$(echo "$line" | jq -r '.text' | sql_escape)
         created_at=$(echo "$line" | jq -r '.created_at' | sql_escape)
 
-        sql+="INSERT IGNORE INTO comments (id, issue_id, author, text, created_at) VALUES ($id, '${issue_id}', '${author}', '${text}', '${created_at}');\n"
+        # Skip orphan comments (issue_id must exist in issues table)
+        if [[ -n "$known_ids" ]] && ! echo "$known_ids" | grep -qxF "$issue_id"; then
+            echo -e "\n  ${YELLOW}⚠${NC}  skipping orphan comment: comment_id=$id, issue_id=$issue_id not in issues" >&2
+            comments_orphan=$((comments_orphan + 1))
+            validation_errors=$((validation_errors + 1))
+            continue
+        fi
+
+        local esc_iid
+        esc_iid=$(echo "$issue_id" | sql_escape)
+        sql+="INSERT IGNORE INTO comments (id, issue_id, author, text, created_at) VALUES ($id, '${esc_iid}', '${author}', '${text}', '${created_at}');\n"
         comments_count=$((comments_count + 1))
     done < "$file"
     sql+="COMMIT;\n"
@@ -347,7 +412,11 @@ import_comments() {
         echo -e "$sql"
     else
         echo -e "$sql" | pipe_sql
-        echo -e " ${GREEN}✓${NC} $comments_count rows"
+        if [[ $comments_orphan -gt 0 ]]; then
+            echo -e " ${GREEN}✓${NC} $comments_count rows ($comments_orphan orphans skipped)"
+        else
+            echo -e " ${GREEN}✓${NC} $comments_count rows"
+        fi
     fi
 }
 
@@ -412,11 +481,33 @@ echo "  Comments:      $comments_count"
 echo "  Config:        $config_count"
 total=$((issues_count + labels_count + deps_count + events_count + comments_count + config_count))
 echo "  Total:         $total rows imported"
-if [[ $deps_orphan -gt 0 ]]; then
+
+# Report validation failures
+if [[ $validation_errors -gt 0 ]]; then
     echo ""
-    echo -e "  ${YELLOW}⚠${NC}  $deps_orphan orphan dependencies were skipped"
+    echo -e "${BOLD}Validation Issues:${NC}"
+    if [[ $issues_invalid_id -gt 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC}  $issues_invalid_id issues with invalid ID format (expected: prefix-hash)"
+    fi
+    if [[ $labels_orphan -gt 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC}  $labels_orphan orphan labels (referencing non-existent issues)"
+    fi
+    if [[ $comments_orphan -gt 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC}  $comments_orphan orphan comments (referencing non-existent issues)"
+    fi
+    if [[ $deps_orphan -gt 0 ]]; then
+        echo -e "  ${YELLOW}⚠${NC}  $deps_orphan orphan dependencies (referencing non-existent issues)"
+    fi
+    echo -e "  ${BOLD}Total validation errors: $validation_errors${NC}"
 fi
 echo ""
+
+# ── Validation gate ────────────────────────────────────────────────
+if [[ $validation_errors -gt 0 ]]; then
+    echo -e "${RED}✗ Migration aborted: $validation_errors validation errors detected${NC}"
+    echo "Fix the data integrity issues above before retrying the migration."
+    exit 1
+fi
 
 # ── Dolt commit ────────────────────────────────────────────────────
 if ! $DRY_RUN && [[ $total -gt 0 ]]; then
